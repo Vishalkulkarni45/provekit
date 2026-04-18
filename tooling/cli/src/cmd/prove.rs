@@ -4,7 +4,7 @@ use {
     argh::FromArgs,
     provekit_common::{
         file::{read, write},
-        Prover,
+        preflight_cuda_backend, set_ntt_backend, NttBackend, Prover,
     },
     provekit_prover::Prove,
     std::path::PathBuf,
@@ -17,6 +17,11 @@ use {provekit_common::Verifier, provekit_verifier::Verify};
 #[derive(FromArgs, PartialEq, Eq, Debug)]
 #[argh(subcommand, name = "prove")]
 pub struct Args {
+    /// use the CUDA NTT backend for proving; errors if CUDA support is
+    /// unavailable
+    #[argh(switch)]
+    cuda: bool,
+
     /// path to the prepared proof scheme
     #[argh(positional)]
     prover_path: PathBuf,
@@ -43,6 +48,13 @@ pub struct Args {
 impl Command for Args {
     #[instrument(skip_all)]
     fn run(&self) -> Result<()> {
+        if self.cuda {
+            set_ntt_backend(NttBackend::Cuda)
+                .context("while selecting the CUDA NTT backend for `prove`")?;
+            preflight_cuda_backend()
+                .context("while preflighting the CUDA NTT backend for `prove --cuda`")?;
+        }
+
         // Read the scheme
         let prover: Prover = read(&self.prover_path).context("while reading Provekit Prover")?;
         let (constraints, witnesses) = prover.size();
@@ -67,5 +79,29 @@ impl Command for Args {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(all(test, not(feature = "cuda")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cuda_requires_cuda_feature() {
+        let args = Args {
+            cuda:          true,
+            prover_path:   std::env::temp_dir().join("unused-prover.pkp"),
+            verifier_path: std::env::temp_dir().join("unused-verifier.pkv"),
+            input_path:    std::env::temp_dir().join("unused-prover.toml"),
+            proof_path:    std::env::temp_dir().join("unused-proof.np"),
+        };
+
+        let err = args
+            .run()
+            .expect_err("`prove --cuda` should fail without the `cuda` feature");
+        assert!(
+            err.to_string().contains("built without the `cuda` feature"),
+            "unexpected error: {err:#}"
+        );
     }
 }
