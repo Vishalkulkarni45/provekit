@@ -124,6 +124,12 @@ fn extend_roots_table<'a>(codeword_size: usize) -> RwLockReadGuard<'a, NTTEngine
     new_root
 }
 
+#[cfg(feature = "cuda")]
+pub(crate) fn reverse_ordered_roots(codeword_size: usize) -> Vec<Fr> {
+    let roots = extend_roots_table(codeword_size);
+    roots.0[..codeword_size / 2].to_vec()
+}
+
 impl Default for NTTEngine {
     fn default() -> Self {
         Self::new()
@@ -349,6 +355,8 @@ fn intt_nr(values: &mut [Fr]) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "cuda")]
+    use crate::{ntt_nr_cuda, preflight_cuda};
     #[cfg(test)]
     use proptest::prelude::*;
     use {
@@ -358,11 +366,12 @@ mod tests {
             ntt_nr,
         },
         ark_bn254::Fr,
-        ark_ff::BigInt,
+        ark_ff::{AdditiveGroup, BigInt},
         proptest::collection,
         std::{
             fmt,
             num::{NonZero, NonZeroUsize},
+            sync::OnceLock,
         },
     };
 
@@ -541,5 +550,64 @@ mod tests {
             assert_eq!(original, v)
         }
 
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_ready() -> bool {
+        static CUDA_READY: OnceLock<bool> = OnceLock::new();
+
+        *CUDA_READY.get_or_init(|| match preflight_cuda() {
+            Ok(()) => true,
+            Err(err) => {
+                eprintln!("skipping CUDA NTT parity tests because CUDA is unavailable: {err:#}");
+                false
+            }
+        })
+    }
+
+    #[cfg(feature = "cuda")]
+    proptest! {
+        #[test]
+        fn cuda_matches_cpu_ntt(original in hidden_ntt(0_usize..15, fr())) {
+            if !cuda_ready() {
+                return Ok(());
+            }
+
+            let mut cpu = original.0.clone();
+            let mut gpu = original.0;
+            let codeword_size = cpu.len();
+
+            ntt_nr(&mut cpu, codeword_size, 1);
+            ntt_nr_cuda(&mut gpu, codeword_size, 1)
+                .map_err(|err| TestCaseError::fail(format!("{err:#}")))?;
+
+            prop_assert_eq!(cpu, gpu);
+        }
+
+        #[test]
+        fn cuda_matches_cpu_grouped_ntt(
+            log_codeword in 0_usize..12,
+            log_groups in 0_usize..12,
+            values_flat in collection::vec(fr(), 0..=32768),
+        ) {
+            if !cuda_ready() {
+                return Ok(());
+            }
+
+            let codeword_size = 1 << log_codeword;
+            let log_groups = log_groups.min(log_codeword);
+            let num_groups = 1 << log_groups;
+            let total = codeword_size * num_groups;
+
+            let mut cpu = values_flat;
+            cpu.resize(total, Fr::ZERO);
+            let mut gpu = cpu.clone();
+
+            ntt_nr(&mut cpu, codeword_size, num_groups);
+            ntt_nr_cuda(&mut gpu, codeword_size, num_groups)
+                .map_err(|err| TestCaseError::fail(format!("{err:#}")))?;
+
+            prop_assert_eq!(cpu, gpu);
+        }
     }
 }

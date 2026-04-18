@@ -1,3 +1,5 @@
+#[cfg(feature = "cuda")]
+use provekit_common::ntt::RSFrCuda;
 use {
     ark_bn254::Fr,
     ark_ff::UniformRand,
@@ -60,6 +62,20 @@ fn whir_ntt_engine(bencher: Bencher, case: &(usize, usize, usize)) {
             let refs: Vec<&[Fr]> = coeffs.iter().map(Vec::as_slice).collect();
             let codeword_length = refs[0].len() * expansion;
             black_box(reference.interleaved_encode(&refs, &mask, codeword_length))
+        });
+}
+
+#[cfg(feature = "cuda")]
+#[divan::bench(args = TEST_CASES)]
+fn rs_fr_cuda(bencher: Bencher, case: &(usize, usize, usize)) {
+    let (exp, expansion, coset_sz) = *case;
+    let mask = make_mask(1 << coset_sz);
+    bencher
+        .with_inputs(|| make_messages(exp, coset_sz))
+        .bench_values(|coeffs| {
+            let refs: Vec<&[Fr]> = coeffs.iter().map(Vec::as_slice).collect();
+            let codeword_length = refs[0].len() * expansion;
+            black_box(RSFrCuda.interleaved_encode(&refs, &mask, codeword_length))
         });
 }
 
