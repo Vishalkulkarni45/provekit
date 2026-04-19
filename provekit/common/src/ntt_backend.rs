@@ -113,6 +113,17 @@ pub(crate) fn register_ntt() -> Result<()> {
     // Register Skyscraper (ProveKit-specific); WHIR's built-in engines
     // (SHA2, Keccak, Blake3, etc.) are pre-registered via whir::hash::ENGINES.
     whir::hash::ENGINES.register(Arc::new(skyscraper::SkyscraperHashEngine));
+
+    // When running on CUDA, override WHIR's CPU SHA-256 with the CUDA-backed
+    // engine under the SAME EngineId. This routes every Merkle-tree leaf /
+    // internal hash via the GPU for batches >= `cuda_sha256_min_batch()`.
+    // Small batches still fall back to the upstream sha2 crate inside
+    // `CudaSha2::hash_many`.
+    #[cfg(feature = "cuda")]
+    if backend == NttBackend::Cuda {
+        whir::hash::ENGINES.register(Arc::new(crate::sha256_cuda_engine::CudaSha2::new()));
+    }
+
     state.registered = Some(backend);
 
     Ok(())
