@@ -1,10 +1,9 @@
 use {
     anyhow::{anyhow, ensure, Context, Result},
     ark_bn254::Fr,
-    ark_ff::{AdditiveGroup, BigInt, PrimeField},
+    ark_ff::{AdditiveGroup, PrimeField},
     rayon::prelude::{
-        IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator,
-        ParallelIterator, ParallelSlice, ParallelSliceMut,
+        IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator, ParallelSliceMut,
     },
     std::{
         collections::HashMap,
@@ -19,6 +18,42 @@ const CUDA_SUCCESS: c_int = 0;
 const ERROR_BUFFER_LEN: usize = 1024;
 const PARALLEL_MARSHAL_THRESHOLD: usize = 1 << 14;
 const MAX_CODEWORD_ORDER: usize = 1 << 28;
+
+// Static assertions: `Fr` must be layout-compatible with `[u64; LIMBS_PER_FR]`
+// so we can reinterpret `&[Fr]` as `&[u64]` without copying.
+// `ark-ff`'s `Fp<P, N>` wraps a single `BigInt<N>` (plus a zero-sized PhantomData);
+// `BigInt<N>` wraps `[u64; N]`. The compiler is free to lay this out, but in
+// every version of ark-ff through 0.5 the non-ZST field is the only real
+// storage, so size and alignment must match `[u64; 4]`. We enforce that at
+// compile time below; if a future ark-ff release changes the layout this
+// will refuse to build, forcing a revisit of the zero-copy path.
+const _: () = {
+    assert!(std::mem::size_of::<Fr>() == LIMBS_PER_FR * std::mem::size_of::<u64>());
+    assert!(std::mem::align_of::<Fr>() >= std::mem::align_of::<u64>());
+};
+
+/// Reinterpret `&[Fr]` as `&[u64]` without copying. Safe given the layout
+/// assertions above: each `Fr` is exactly `LIMBS_PER_FR` u64 limbs in
+/// Montgomery form, which is the representation the CUDA kernel expects.
+#[inline]
+fn fr_slice_as_u64(values: &[Fr]) -> &[u64] {
+    // SAFETY: const-asserted size/alignment match. `Fr` is `Copy`, plain old
+    // data (no niches), and aligned to at least 8 bytes.
+    unsafe {
+        std::slice::from_raw_parts(values.as_ptr() as *const u64, values.len() * LIMBS_PER_FR)
+    }
+}
+
+#[inline]
+fn fr_slice_as_u64_mut(values: &mut [Fr]) -> &mut [u64] {
+    // SAFETY: same as `fr_slice_as_u64`.
+    unsafe {
+        std::slice::from_raw_parts_mut(
+            values.as_mut_ptr() as *mut u64,
+            values.len() * LIMBS_PER_FR,
+        )
+    }
+}
 
 unsafe extern "C" {
     fn provekit_cuda_ntt_preflight(
@@ -188,29 +223,21 @@ fn montgomery_inv(modulus_limb_0: u64) -> u64 {
     inv.wrapping_neg()
 }
 
-fn host_values_scratch() -> &'static Mutex<Vec<u64>> {
-    static HOST_VALUES_SCRATCH: OnceLock<Mutex<Vec<u64>>> = OnceLock::new();
-
-    HOST_VALUES_SCRATCH.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-fn marshal_field_elements_into(values: &[Fr], flat: &mut [u64]) {
-    debug_assert_eq!(flat.len(), values.len() * LIMBS_PER_FR);
-
-    if values.len() >= PARALLEL_MARSHAL_THRESHOLD {
+/// Flatten the precomputed twiddle roots into a u64 limb vector. Only called
+/// once per unique codeword size (cached in `flattened_roots`); the main
+/// per-NTT flatten/hydrate copies have been removed in favour of zero-copy
+/// reinterpretation of `[Fr]` as `[u64]` — see `fr_slice_as_u64_mut`.
+fn flatten_roots_into(roots: &[Fr], flat: &mut Vec<u64>) {
+    flat.resize(roots.len() * LIMBS_PER_FR, 0);
+    if roots.len() >= PARALLEL_MARSHAL_THRESHOLD {
         flat.par_chunks_exact_mut(LIMBS_PER_FR)
-            .zip(values.par_iter())
+            .zip(roots.par_iter())
             .for_each(|(limbs, value)| limbs.copy_from_slice(&value.0 .0));
     } else {
-        for (limbs, value) in flat.chunks_exact_mut(LIMBS_PER_FR).zip(values) {
+        for (limbs, value) in flat.chunks_exact_mut(LIMBS_PER_FR).zip(roots) {
             limbs.copy_from_slice(&value.0 .0);
         }
     }
-}
-
-fn flatten_field_elements_into(values: &[Fr], flat: &mut Vec<u64>) {
-    flat.resize(values.len() * LIMBS_PER_FR, 0);
-    marshal_field_elements_into(values, flat.as_mut_slice());
 }
 
 fn next_order_impl(size: usize) -> Option<usize> {
@@ -261,7 +288,7 @@ fn flattened_roots(codeword_size: usize) -> Arc<[u64]> {
     }
 
     let mut flat = Vec::new();
-    flatten_field_elements_into(&crate::ntt::reverse_ordered_roots(codeword_size), &mut flat);
+    flatten_roots_into(&crate::ntt::reverse_ordered_roots(codeword_size), &mut flat);
     let flattened: Arc<[u64]> = flat.into();
     flattened_roots.insert(codeword_size, Arc::clone(&flattened));
     flattened
@@ -269,58 +296,6 @@ fn flattened_roots(codeword_size: usize) -> Arc<[u64]> {
 
 fn should_check_hydrated_value(index: usize, len: usize, stride: usize) -> bool {
     stride == 1 || (stride > 1 && (index == 0 || index + 1 == len || index.is_multiple_of(stride)))
-}
-
-fn hydrate_field_elements(flat: &[u64], values: &mut [Fr]) -> Result<()> {
-    ensure!(
-        flat.len() == values.len() * LIMBS_PER_FR,
-        "expected {} u64 limbs for {} field elements, got {} limbs instead",
-        values.len() * LIMBS_PER_FR,
-        values.len(),
-        flat.len()
-    );
-
-    let release_guard_stride = if cfg!(debug_assertions) {
-        1
-    } else {
-        cuda_release_guard_stride()?
-    };
-    let len = values.len();
-
-    if values.len() >= PARALLEL_MARSHAL_THRESHOLD {
-        values
-            .par_iter_mut()
-            .enumerate()
-            .zip(flat.par_chunks_exact(LIMBS_PER_FR))
-            .try_for_each(|((index, slot), limbs)| -> Result<()> {
-                let value = BigInt([limbs[0], limbs[1], limbs[2], limbs[3]]);
-                if should_check_hydrated_value(index, len, release_guard_stride) {
-                    ensure!(
-                        value < Fr::MODULUS,
-                        "CUDA kernel returned a value outside the BN254 field"
-                    );
-                }
-                *slot = Fr::new_unchecked(value);
-                Ok(())
-            })?;
-    } else {
-        for (index, (slot, limbs)) in values
-            .iter_mut()
-            .zip(flat.chunks_exact(LIMBS_PER_FR))
-            .enumerate()
-        {
-            let value = BigInt([limbs[0], limbs[1], limbs[2], limbs[3]]);
-            if should_check_hydrated_value(index, len, release_guard_stride) {
-                ensure!(
-                    value < Fr::MODULUS,
-                    "CUDA kernel returned a value outside the BN254 field"
-                );
-            }
-            *slot = Fr::new_unchecked(value);
-        }
-    }
-
-    Ok(())
 }
 
 fn cuda_runtime_state() -> &'static CudaRuntimeState {
@@ -349,8 +324,12 @@ pub fn preflight_cuda() -> Result<()> {
         .map_err(anyhow::Error::msg)
 }
 
-fn ntt_nr_cuda_flat(
-    values_flat: &mut Vec<u64>,
+/// Zero-copy entry point: caller supplies raw limb pointers. Used by
+/// `ntt_nr_cuda` and `interleaved_encode_cuda` after reinterpreting their
+/// `Fr` buffers as `u64` limbs.
+fn ntt_nr_cuda_raw(
+    host_input: *const u64,
+    host_output: *mut u64,
     input_elements: usize,
     total_values: usize,
     codeword_size: usize,
@@ -374,14 +353,13 @@ fn ntt_nr_cuda_flat(
     preflight_cuda()?;
 
     let runtime = cuda_runtime_state();
-    values_flat.resize(total_values * LIMBS_PER_FR, 0);
     let roots_flat = flattened_roots(codeword_size);
     let mut error_buffer = [0_i8; ERROR_BUFFER_LEN];
 
     let status = unsafe {
         provekit_cuda_interleaved_ntt(
             runtime.device as c_int,
-            values_flat.as_ptr(),
+            host_input,
             input_elements,
             total_values,
             roots_flat.as_ptr(),
@@ -390,7 +368,7 @@ fn ntt_nr_cuda_flat(
             num_groups,
             runtime.modulus.as_ptr(),
             runtime.montgomery_inv,
-            values_flat.as_mut_ptr(),
+            host_output,
             error_buffer.as_mut_ptr(),
             error_buffer.len(),
         )
@@ -430,17 +408,56 @@ pub fn ntt_nr_cuda(values: &mut [Fr], codeword_size: usize, num_groups: usize) -
         return Ok(());
     }
 
-    let scratch = host_values_scratch();
-    let mut values_flat = scratch.lock().unwrap();
-    flatten_field_elements_into(values, &mut values_flat);
-    ntt_nr_cuda_flat(
-        &mut values_flat,
-        values.len(),
-        values.len(),
+    // Zero-copy: reinterpret the Fr slice as u64 limbs and call CUDA in-place.
+    let len = values.len();
+    let limbs = fr_slice_as_u64_mut(values);
+    ntt_nr_cuda_raw(
+        limbs.as_ptr(),
+        limbs.as_mut_ptr(),
+        len,
+        len,
         codeword_size,
         num_groups,
     )?;
-    hydrate_field_elements(&values_flat, values)
+
+    if cfg!(debug_assertions) {
+        // Cheap sanity check: re-validate every result limb lies inside the
+        // BN254 field. In release this is handled by the
+        // PROVEKIT_CUDA_NTT_RELEASE_GUARD_STRIDE heuristic instead.
+        for value in values.iter() {
+            ensure!(
+                value.0 < Fr::MODULUS,
+                "CUDA kernel returned a value outside the BN254 field"
+            );
+        }
+    } else {
+        release_guard_check(values)?;
+    }
+
+    Ok(())
+}
+
+/// Run the release-mode striped range check for CUDA NTT outputs without
+/// allocating a scratch buffer. Mirrors the semantics of the removed
+/// `hydrate_field_elements` guard.
+fn release_guard_check(values: &[Fr]) -> Result<()> {
+    let stride = cuda_release_guard_stride()?;
+    if stride == 0 {
+        return Ok(());
+    }
+    let len = values.len();
+    if len == 0 {
+        return Ok(());
+    }
+    for (index, value) in values.iter().enumerate() {
+        if should_check_hydrated_value(index, len, stride) {
+            ensure!(
+                value.0 < Fr::MODULUS,
+                "CUDA kernel returned a value outside the BN254 field"
+            );
+        }
+    }
+    Ok(())
 }
 
 pub fn interleaved_encode_cuda(
@@ -499,9 +516,11 @@ pub fn interleaved_encode_cuda(
         return Ok(result);
     }
 
-    let scratch = host_values_scratch();
-    let mut values_flat = scratch.lock().unwrap();
-    let host_values = build_interleaved_host_values(
+    // Zero-copy: build the interleaved layout directly in the result buffer,
+    // reinterpret its Fr slice as u64 limbs, and hand that pointer to CUDA as
+    // both input and output. Removes two host-side 128 MB copies (Fr→u64
+    // flatten and u64→Fr hydrate) and one extra Vec<Fr> allocation per call.
+    let mut values = build_interleaved_host_values(
         messages,
         masks,
         message_length,
@@ -509,17 +528,19 @@ pub fn interleaved_encode_cuda(
         coset_size * num_messages,
         num_cosets,
     );
-    flatten_field_elements_into(&host_values, &mut values_flat);
 
-    ntt_nr_cuda_flat(
-        &mut values_flat,
-        total_values,
-        total_values,
-        codeword_length,
-        num_cosets,
-    )?;
+    {
+        let limbs = fr_slice_as_u64_mut(&mut values);
+        ntt_nr_cuda_raw(
+            limbs.as_ptr(),
+            limbs.as_mut_ptr(),
+            total_values,
+            total_values,
+            codeword_length,
+            num_cosets,
+        )?;
+    }
 
-    let mut values = vec![Fr::ZERO; total_values];
-    hydrate_field_elements(&values_flat, &mut values)?;
+    release_guard_check(&values)?;
     Ok(values)
 }
