@@ -26,7 +26,13 @@ struct DeviceBuffer {
 struct HostRegistration {
     unsigned long long *ptr = nullptr;
     size_t registered_bytes = 0;
-    bool registration_enabled = true;
+    // Default: off. The zero-copy path (see ntt/src/cuda.rs) hands us a new
+    // host buffer on every call, so pinning would re-pin 128 MB per big NTT
+    // call (~15 ms wasted). Pageable cudaMemcpyAsync on CUDA 13 staging
+    // buffers reaches ~12 GB/s which is within a few ms of pinned for our
+    // 128 MB transfers. Opt-in via PROVEKIT_CUDA_NTT_PIN_HOST_BUFFER=1 for
+    // workloads that reuse the same host buffer many times.
+    bool registration_enabled = false;
 };
 
 struct CudaNttContext {
@@ -219,6 +225,15 @@ int configure_context_tuning(
 
     context.threads_per_block = default_threads_per_block(properties);
     context.fused_tail_max_elements = default_fused_tail_max_elements(properties);
+
+    // Opt-in host buffer pinning. See HostRegistration.registration_enabled
+    // for the default-off rationale.
+    const char *pin_raw = std::getenv("PROVEKIT_CUDA_NTT_PIN_HOST_BUFFER");
+    if (pin_raw != nullptr && pin_raw[0] != '\0' &&
+        (pin_raw[0] == '1' || pin_raw[0] == 't' || pin_raw[0] == 'T' ||
+         pin_raw[0] == 'y' || pin_raw[0] == 'Y')) {
+        context.host_values.registration_enabled = true;
+    }
 
     size_t env_threads = 0;
     if (parse_env_size("PROVEKIT_CUDA_NTT_THREADS_PER_BLOCK", &env_threads)) {
