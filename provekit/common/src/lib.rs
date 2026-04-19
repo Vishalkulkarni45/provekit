@@ -6,6 +6,8 @@ mod mavros;
 mod noir_proof_scheme;
 pub mod ntt;
 mod ntt_backend;
+#[cfg(feature = "cuda")]
+mod sha256_cuda_engine;
 pub mod optimize;
 pub mod prefix_covector;
 mod prover;

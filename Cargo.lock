@@ -4570,6 +4570,7 @@ dependencies = [
  "ruint",
  "serde",
  "serde_json",
+ "sha2",
  "sha3",
  "skyscraper",
  "spongefish",
