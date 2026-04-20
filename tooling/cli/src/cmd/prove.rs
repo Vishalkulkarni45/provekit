@@ -48,17 +48,29 @@ pub struct Args {
 impl Command for Args {
     #[instrument(skip_all)]
     fn run(&self) -> Result<()> {
-        if self.cuda {
+        // Overlap CUDA context init with the (~500 ms) Xz decompression of
+        // prover.pkp. `preflight_cuda_backend` is idempotent; `set_ntt_backend`
+        // only updates the requested backend state, so it is safe to run on
+        // the main thread before spawning.
+        let preflight = if self.cuda {
             set_ntt_backend(NttBackend::Cuda)
                 .context("while selecting the CUDA NTT backend for `prove`")?;
-            preflight_cuda_backend()
-                .context("while preflighting the CUDA NTT backend for `prove --cuda`")?;
-        }
+            Some(std::thread::spawn(|| preflight_cuda_backend()))
+        } else {
+            None
+        };
 
         // Read the scheme
         let prover: Prover = read(&self.prover_path).context("while reading Provekit Prover")?;
         let (constraints, witnesses) = prover.size();
         info!(constraints, witnesses, "Read Noir proof scheme");
+
+        if let Some(handle) = preflight {
+            handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("CUDA preflight thread panicked"))?
+                .context("while preflighting the CUDA NTT backend for `prove --cuda`")?;
+        }
 
         // Generate the proof
         let proof = prover

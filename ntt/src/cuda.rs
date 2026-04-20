@@ -116,6 +116,15 @@ fn cuda_device_index() -> Result<usize> {
         .map_err(anyhow::Error::msg)
 }
 
+// RTX 5080 has 84 SMs; at the default 256 threads/block the first NTT stage
+// needs ~504 blocks (129 K butterflies) to saturate. Codeword lengths at or
+// below 1024 launch only 4-16 blocks (<4 % SM utilisation) and are slower on
+// the GPU than on a modern CPU (measured on 9800X3D: GPU 0.05-0.24 ms vs CPU
+// 0.03-0.16 ms per call). The 2048 default keeps them on the CPU while still
+// offloading every call that is materially larger, including the
+// 168-message 2048-codeword case (344 K total values, GPU 2.1× faster).
+const DEFAULT_MIN_CODEWORD_SIZE: usize = 2048;
+
 fn cuda_min_codeword_size() -> Result<usize> {
     static CUDA_MIN_CODEWORD_SIZE: OnceLock<Result<usize, String>> = OnceLock::new();
 
@@ -127,7 +136,7 @@ fn cuda_min_codeword_size() -> Result<usize> {
                      `{value}` instead: {err}"
                 )
             }),
-            Err(env::VarError::NotPresent) => Ok(0),
+            Err(env::VarError::NotPresent) => Ok(DEFAULT_MIN_CODEWORD_SIZE),
             Err(err) => Err(format!(
                 "failed to read PROVEKIT_CUDA_NTT_MIN_CODEWORD_SIZE for CUDA NTT tuning: {err}"
             )),
