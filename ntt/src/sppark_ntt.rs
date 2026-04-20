@@ -183,9 +183,15 @@ pub fn interleaved_encode_sppark(
             work[message_length..message_length + masks_per_msg].copy_from_slice(src);
         }
 
+        // NR = natural in, reverse-bit out. This matches the in-tree
+        // `ntt_nr` output bit-for-bit, independently verified by a small
+        // cross-check (see results/71_sppark_correctness.log). The in-tree
+        // replication trick + short-stage interleaved NTT and a standard
+        // zero-padded NTT produce the same LDE values; the "NR" ordering
+        // is what reconciles the two output layouts.
         sppark_ntt(
             &mut work,
-            NttOrder::NN,
+            NttOrder::NR,
             NttDirection::Forward,
             NttType::Standard,
         )?;

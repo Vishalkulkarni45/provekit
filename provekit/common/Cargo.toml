@@ -13,6 +13,9 @@ default = ["parallel"]
 parallel = []
 provekit_ntt = []
 cuda = ["ntt/cuda"]
+# Route big-level NTT calls through Supranational's sppark library
+# (with in-tree fallback for small / wide-batch calls where sppark loses).
+cuda-sppark = ["cuda", "ntt/cuda-sppark"]
 
 [dependencies]
 # Workspace crates

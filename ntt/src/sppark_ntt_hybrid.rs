@@ -20,15 +20,37 @@ use {
     ark_bn254::Fr,
 };
 
-/// Dispatch decision: sppark is only faster end-to-end for small batch
-/// counts at big sizes. We tune the threshold empirically.
+use std::{env, sync::OnceLock};
+
+fn env_threshold_codeword() -> usize {
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        env::var("PROVEKIT_SPPARK_MIN_CODEWORD")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(131_072)
+    })
+}
+
+fn env_max_batch() -> usize {
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        env::var("PROVEKIT_SPPARK_MAX_BATCH")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(32)
+    })
+}
+
+/// Dispatch decision: sppark is only faster end-to-end for narrow batches
+/// at big codeword sizes. Empirically tuned for RTX 5080; tunable via
+/// `PROVEKIT_SPPARK_MIN_CODEWORD` (default 131072) and
+/// `PROVEKIT_SPPARK_MAX_BATCH` (default 32).
 pub fn should_use_sppark(codeword_length: usize, num_messages: usize) -> bool {
-    // Wide batches blow up sppark's launch-per-poly cost; keep them on
-    // the in-tree kernel regardless of size.
-    if num_messages >= 32 {
+    if num_messages >= env_max_batch() {
         return false;
     }
-    codeword_length >= 131_072
+    codeword_length >= env_threshold_codeword()
 }
 
 /// Hybrid entrypoint. Callers that would normally invoke the in-tree CUDA

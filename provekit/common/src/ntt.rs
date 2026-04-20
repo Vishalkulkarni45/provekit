@@ -154,6 +154,17 @@ fn interleaved_encode_cuda_impl(
         return interleaved_encode_impl(messages, masks, codeword_length, ntt_nr);
     }
 
+    // Hybrid dispatch: route big-codeword small-batch calls to sppark, keep
+    // everything else on the in-tree kernel. sppark's per-poly launch
+    // overhead dominates when batch is wide (e.g. 168) or size is small.
+    #[cfg(feature = "cuda-sppark")]
+    if ntt::should_use_sppark(codeword_length, num_messages) {
+        return ntt::interleaved_encode_sppark(messages, masks, codeword_length)
+            .unwrap_or_else(|err| {
+                panic!("sppark NTT execution failed after successful backend preflight: {err:#}")
+            });
+    }
+
     ntt::interleaved_encode_cuda(
         messages,
         masks,
