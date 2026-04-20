@@ -11,12 +11,23 @@ repository.workspace = true
 [features]
 default = []
 cuda = ["dep:anyhow"]
+# Optional: route NTTs through Ingonyama's icicle library (CUDA NTT engine).
+# Requires `cuda` to provide the FFI glue; disjoint from the in-tree custom kernel.
+cuda-icicle = [
+    "cuda",
+    "dep:icicle-core",
+    "dep:icicle-bn254",
+    "dep:icicle-cuda-runtime",
+]
 
 [dependencies]
 anyhow = { workspace = true, optional = true }
 ark-bn254.workspace = true
 ark-ff.workspace = true
 rayon.workspace = true
+icicle-core          = { git = "https://github.com/ingonyama-zk/icicle.git", tag = "v2.8.0", optional = true }
+icicle-bn254         = { git = "https://github.com/ingonyama-zk/icicle.git", tag = "v2.8.0", optional = true }
+icicle-cuda-runtime  = { git = "https://github.com/ingonyama-zk/icicle.git", tag = "v2.8.0", optional = true }
 
 [dev-dependencies]
 ark-std.workspace = true
@@ -33,3 +44,13 @@ harness = false
 [[bench]]
 name = "interleaved_ntt"
 harness = false
+
+[[bench]]
+name = "icicle_vs_custom"
+harness = false
+required-features = ["cuda-icicle"]
+
+[[bench]]
+name = "fr_convert"
+harness = false
+required-features = ["cuda-icicle"]
