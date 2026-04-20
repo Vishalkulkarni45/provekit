@@ -1,0 +1,22 @@
+==========================================================================
+ ProveKit GPU-tuned e2e prove — provekit-cli-cuda-tuned --cuda
+ 2026-04-20  RTX 5080 (Blackwell, 84 SMs) + 9800X3D | NTT-only offload, threshold=2048
+==========================================================================
+
+[hyperfine 10-run]
+Benchmark 1: /home/indextree/vishal/provekit/target/release/provekit-cli-cuda-tuned prove --cuda ./prover.pkp ./Prover.toml -o /tmp/p_gpu_screen.np
+  Time (mean ± σ):      1.901 s ±  0.046 s    [User: 6.951 s, System: 0.641 s]
+  Range (min … max):    1.855 s …  1.993 s    10 runs
+ 
+
+[single-run trace - closing span totals]
+│ │ │ │ │ │ ├─╯ inner_blinded_prove: 137 ms duration, 894 MB peak memory, 33.6 MB local, 547 MB current, 38.1k allocations
+│ │ │ │ │ │ ├─╯ inner_blinded_prove: 124 ms duration, 595 MB peak memory, 33.6 MB local, 240 MB current, 38.1k allocations
+│ │ │ │ ├─╯ prove_from_alphas: 625 ms duration, 906 MB peak memory, 107 MB local, 191 MB current, 254k allocations
+├─╯ prove_with_toml: 1.24 s duration, 906 MB peak memory, 460 MB local, 28.6 MB current, 1.33M allocations
+╯ run: 1.78 s duration, 906 MB peak memory, 906 MB local, 25.1 MB current, 4.49M allocations
+
+[verify exit-code]
+verify: exit 0 ; output 272 lines ; final span:
+│ ├─╯ verify: 254 ms duration, 593 MB peak memory, 495 MB local, 97.9 MB current, 98.5k allocations
+├─╯ verify: 254 ms duration, 593 MB peak memory, 495 MB local, 97.8 MB current, 98.7k allocations
