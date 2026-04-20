@@ -11,12 +11,25 @@ repository.workspace = true
 [features]
 default = []
 cuda = ["dep:anyhow"]
+# Optional: route NTTs through Supranational's sppark library
+# (github.com/supranational/sppark). sppark's `fr_t` for bn254 is
+# BIT-COMPATIBLE with arkworks' Fr (same Montgomery R, same modulus,
+# 4 × u64 LE), so we reinterpret `&mut [Fr]` as `*mut fr_t` with zero
+# copy — the format-conversion tax that killed an icicle drop-in does
+# not apply here.
+cuda-sppark = ["cuda", "dep:sppark", "dep:blst"]
 
 [dependencies]
 anyhow = { workspace = true, optional = true }
 ark-bn254.workspace = true
 ark-ff.workspace = true
 rayon.workspace = true
+sppark = { git = "https://github.com/supranational/sppark.git", features = ["cuda"], optional = true }
+blst = { version = "~0.3.11", optional = true }
+
+[build-dependencies]
+sppark = { git = "https://github.com/supranational/sppark.git", features = ["cuda"], optional = true }
+blst = { version = "~0.3.11", optional = true }
 
 [dev-dependencies]
 ark-std.workspace = true
@@ -33,3 +46,8 @@ harness = false
 [[bench]]
 name = "interleaved_ntt"
 harness = false
+
+[[bench]]
+name = "sppark_vs_custom"
+harness = false
+required-features = ["cuda-sppark"]

@@ -64,25 +64,55 @@ fn main() {
     let sm = format!("sm_{cuda_arch}");
 
     // Compile every CUDA translation unit into an object file.
-    let sources = ["src/cuda/interleaved_ntt.cu", "src/cuda/sha256.cu"];
+    let mut sources: Vec<&str> = vec!["src/cuda/interleaved_ntt.cu", "src/cuda/sha256.cu"];
+
+    // When `cuda-sppark` is enabled, compile our sppark shim into the same archive.
+    // sppark's `DEP_SPPARK_ROOT` env var points at its header tree.
+    let with_sppark = env::var_os("CARGO_FEATURE_CUDA_SPPARK").is_some();
+    let sppark_root = env::var_os("DEP_SPPARK_ROOT");
+    if with_sppark {
+        sources.push("src/cuda/sppark_ntt.cu");
+    }
+
     let mut objects = Vec::new();
-    for src in sources {
+    for src in &sources {
         let obj_name = PathBuf::from(src)
             .file_stem()
             .expect("cuda source without a file stem")
             .to_owned();
         let object = out_dir.join(format!("{}.o", obj_name.to_string_lossy()));
-        let compile_status = Command::new(&nvcc)
-            .args(["-c", "-O3", "--std=c++17", "-Xcompiler", "-fPIC"])
+        let mut cmd = Command::new(&nvcc);
+        cmd.args(["-c", "-O3", "--std=c++17", "-Xcompiler", "-fPIC"])
             .args([
                 "-gencode",
                 &format!("arch={compute},code={sm}"),
                 "-gencode",
                 &format!("arch={compute},code={compute}"),
-                src,
-                "-o",
-            ])
-            .arg(&object)
+            ]);
+        // sppark needs its root on the include path + some compile-time flags it
+        // expects from its build helper.
+        if with_sppark && src.contains("sppark_ntt") {
+            if let Some(ref root) = sppark_root {
+                cmd.arg("-I").arg(root);
+            } else {
+                panic!(
+                    "cuda-sppark feature enabled but DEP_SPPARK_ROOT is not set; \
+                     the sppark build-dep must be declared in ntt/Cargo.toml"
+                );
+            }
+            if let Some(blst_src) = env::var_os("DEP_BLST_C_SRC") {
+                cmd.arg("-I").arg(blst_src);
+            } else {
+                panic!(
+                    "cuda-sppark feature enabled but DEP_BLST_C_SRC is not set; \
+                     the blst build-dep must be declared in ntt/Cargo.toml"
+                );
+            }
+            cmd.arg("-DTAKE_RESPONSIBILITY_FOR_ERROR_MESSAGE");
+            cmd.arg("-Xcompiler").arg("-Wno-unused-function");
+        }
+        cmd.arg(src).arg("-o").arg(&object);
+        let compile_status = cmd
             .status()
             .unwrap_or_else(|err| panic!("failed to invoke `{}`: {err}", nvcc.display()));
 
@@ -125,6 +155,16 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-search=native={}", cuda_lib_dir.display());
     println!("cargo:rustc-link-lib=static=provekit_cuda_ntt");
+    // sppark's own build.rs emits `rustc-link-lib=static=sppark_cuda`, but
+    // cargo orders sppark BEFORE ntt in the link command, so `select_gpu`
+    // and friends referenced from provekit_cuda_ntt.a would stay unresolved.
+    // Re-emit sppark_cuda AFTER provekit_cuda_ntt so the linker can close
+    // the reference loop. Cargo dedups same-lib link args in search path
+    // but the second `-l sppark_cuda` survives and appears at the tail of
+    // the link line.
+    if with_sppark {
+        println!("cargo:rustc-link-lib=static=sppark_cuda");
+    }
     println!("cargo:rustc-link-lib=dylib=cudart");
     println!("cargo:rustc-link-lib=dylib=stdc++");
     println!("cargo:warning=building CUDA NTT kernels for compute capability {cuda_arch}");
