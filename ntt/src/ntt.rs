@@ -177,18 +177,8 @@ fn interleaved_ntt_nr(
     // Each unique twiddle factor within a stage is a group.
     let mut elements_in_group = values.len() / num_groups;
 
-    // num of groups is the same as inner inner ntt size
-    // let mut num_groups = 1;
-
-    // For large NTTs we start with linear scans through memory and once all the
-    // elements of the sub NTTs reach the size of workload_size we know that they
-    // are contiguous in cache memory and we switch over to a different strategy.
-    // If at the start the NTT already fits in cache memory we go directly to the
-    // cache strategy strategy.
-
-    // These following two loops could be merged together, but in microbenchmarks
-    // this split performs 5% better than nesting par_iter_mut inside
-    // par_chunks_exact over the ranges 2ˆ20 to 2ˆ24.
+    // Strategy: start with linear scans, then switch to the cache-resident path.
+    // The split loops benchmark ~5% faster than a merged nested parallel variant.
 
     // Parallelizing over the groups is most effective but in the beginning there
     // aren't enough groups to occupy all threads.
@@ -357,8 +347,12 @@ fn intt_nr(values: &mut [Fr]) {
 mod tests {
     #[cfg(feature = "cuda")]
     use crate::{ntt_nr_cuda, preflight_cuda};
+    #[cfg(feature = "cuda")]
+    use ark_ff::AdditiveGroup;
     #[cfg(test)]
     use proptest::prelude::*;
+    #[cfg(feature = "cuda")]
+    use std::sync::OnceLock;
     use {
         super::{init_roots_reverse_ordered, reverse_order},
         crate::{
@@ -366,12 +360,11 @@ mod tests {
             ntt_nr,
         },
         ark_bn254::Fr,
-        ark_ff::{AdditiveGroup, BigInt},
+        ark_ff::BigInt,
         proptest::collection,
         std::{
             fmt,
             num::{NonZero, NonZeroUsize},
-            sync::OnceLock,
         },
     };
 

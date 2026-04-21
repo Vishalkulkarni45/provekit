@@ -19,34 +19,16 @@ const ERROR_BUFFER_LEN: usize = 1024;
 const PARALLEL_MARSHAL_THRESHOLD: usize = 1 << 14;
 const MAX_CODEWORD_ORDER: usize = 1 << 28;
 
-// Static assertions: `Fr` must be layout-compatible with `[u64; LIMBS_PER_FR]`
-// so we can reinterpret `&[Fr]` as `&[u64]` without copying.
-// `ark-ff`'s `Fp<P, N>` wraps a single `BigInt<N>` (plus a zero-sized PhantomData);
-// `BigInt<N>` wraps `[u64; N]`. The compiler is free to lay this out, but in
-// every version of ark-ff through 0.5 the non-ZST field is the only real
-// storage, so size and alignment must match `[u64; 4]`. We enforce that at
-// compile time below; if a future ark-ff release changes the layout this
-// will refuse to build, forcing a revisit of the zero-copy path.
+// Layout checks for zero-copy reinterpretation of `Fr` as `[u64; LIMBS_PER_FR]`.
 const _: () = {
     assert!(std::mem::size_of::<Fr>() == LIMBS_PER_FR * std::mem::size_of::<u64>());
     assert!(std::mem::align_of::<Fr>() >= std::mem::align_of::<u64>());
 };
 
-/// Reinterpret `&[Fr]` as `&[u64]` without copying. Safe given the layout
-/// assertions above: each `Fr` is exactly `LIMBS_PER_FR` u64 limbs in
-/// Montgomery form, which is the representation the CUDA kernel expects.
-#[inline]
-fn fr_slice_as_u64(values: &[Fr]) -> &[u64] {
-    // SAFETY: const-asserted size/alignment match. `Fr` is `Copy`, plain old
-    // data (no niches), and aligned to at least 8 bytes.
-    unsafe {
-        std::slice::from_raw_parts(values.as_ptr() as *const u64, values.len() * LIMBS_PER_FR)
-    }
-}
-
 #[inline]
 fn fr_slice_as_u64_mut(values: &mut [Fr]) -> &mut [u64] {
-    // SAFETY: same as `fr_slice_as_u64`.
+    // SAFETY: size/alignment are const-asserted above and each Fr stores
+    // exactly LIMBS_PER_FR u64 limbs in Montgomery form.
     unsafe {
         std::slice::from_raw_parts_mut(
             values.as_mut_ptr() as *mut u64,
@@ -116,13 +98,7 @@ fn cuda_device_index() -> Result<usize> {
         .map_err(anyhow::Error::msg)
 }
 
-// RTX 5080 has 84 SMs; at the default 256 threads/block the first NTT stage
-// needs ~504 blocks (129 K butterflies) to saturate. Codeword lengths at or
-// below 1024 launch only 4-16 blocks (<4 % SM utilisation) and are slower on
-// the GPU than on a modern CPU (measured on 9800X3D: GPU 0.05-0.24 ms vs CPU
-// 0.03-0.16 ms per call). The 2048 default keeps them on the CPU while still
-// offloading every call that is materially larger, including the
-// 168-message 2048-codeword case (344 K total values, GPU 2.1× faster).
+// Keep very small codewords on CPU to avoid low-occupancy GPU launches.
 const DEFAULT_MIN_CODEWORD_SIZE: usize = 2048;
 
 fn cuda_min_codeword_size() -> Result<usize> {
@@ -304,7 +280,7 @@ fn flattened_roots(codeword_size: usize) -> Arc<[u64]> {
 }
 
 fn should_check_hydrated_value(index: usize, len: usize, stride: usize) -> bool {
-    stride == 1 || (stride > 1 && (index == 0 || index + 1 == len || index.is_multiple_of(stride)))
+    stride == 1 || (stride > 1 && (index == 0 || index + 1 == len || index % stride == 0))
 }
 
 fn cuda_runtime_state() -> &'static CudaRuntimeState {
@@ -351,7 +327,7 @@ fn ntt_nr_cuda_raw(
         "input_elements must be <= total_values"
     );
     ensure!(
-        total_values.is_multiple_of(num_groups),
+        total_values % num_groups == 0,
         "total_values must be divisible by num_groups"
     );
     ensure!(
@@ -491,15 +467,16 @@ pub fn interleaved_encode_cuda(
         );
     }
     ensure!(
-        masks.len().is_multiple_of(num_messages),
+        masks.len() % num_messages == 0,
         "masks.len() must be divisible by the number of messages"
     );
     ensure!(
         codeword_length.is_power_of_two(),
         "codeword_length must be a power of two"
     );
+    ensure!(coset_size > 0, "coset_size must be non-zero");
     ensure!(
-        codeword_length.is_multiple_of(coset_size),
+        codeword_length % coset_size == 0,
         "codeword_length must be divisible by coset_size"
     );
     ensure!(
